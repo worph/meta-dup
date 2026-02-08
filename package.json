@@ -1,0 +1,15 @@
+{
+  "name": "meta-dup",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone duplicate detection service for MetaMesh",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm -r --parallel dev",
+    "start": "pnpm --filter @meta-dup/core start",
+    "start:ui": "pnpm --filter @meta-dup/ui dev",
+    "test": "pnpm --filter @meta-dup/core test",
+    "lint": "pnpm -r lint"
+  },
+  "license": "MIT"
+}
