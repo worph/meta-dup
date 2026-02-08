@@ -63,6 +63,10 @@ export class DuplicateIndex {
     private byHash: Map<string, Set<string>> = new Map();
     private byTitle: Map<string, Set<string>> = new Map();
 
+    // Track paths by midhash256 (for hash duplicates from events)
+    // This detects duplicates directly from the event stream without Redis lookup
+    private pathsByMidHash: Map<string, Set<string>> = new Map();
+
     // File info storage: hashId -> FileInfo
     private fileInfo: Map<string, FileInfo> = new Map();
 
@@ -71,6 +75,34 @@ export class DuplicateIndex {
 
     constructor() {
         logger.info('DuplicateIndex initialized');
+    }
+
+    /**
+     * Add a path to the midhash tracking (for hash duplicates from events)
+     */
+    addPath(midhash256: string, path: string): void {
+        const pathSet = this.pathsByMidHash.get(midhash256) ?? new Set();
+        pathSet.add(path);
+        this.pathsByMidHash.set(midhash256, pathSet);
+        this.lastUpdated = new Date();
+
+        if (pathSet.size > 1) {
+            logger.info(`Hash duplicate detected: ${midhash256} has ${pathSet.size} paths`);
+        }
+    }
+
+    /**
+     * Remove a path from the midhash tracking
+     */
+    removePath(midhash256: string, path: string): void {
+        const pathSet = this.pathsByMidHash.get(midhash256);
+        if (pathSet) {
+            pathSet.delete(path);
+            if (pathSet.size === 0) {
+                this.pathsByMidHash.delete(midhash256);
+            }
+            this.lastUpdated = new Date();
+        }
     }
 
     /**
@@ -194,13 +226,57 @@ export class DuplicateIndex {
     }
 
     /**
-     * Get all hash-based duplicates (files with same SHA-256)
+     * Get path-based duplicates (files with same midhash256 from events)
+     * These are detected directly from the event stream without Redis lookup
+     */
+    getPathDuplicates(): DuplicateGroup[] {
+        const groups: DuplicateGroup[] = [];
+
+        for (const [midhash256, paths] of this.pathsByMidHash) {
+            if (paths.size > 1) {
+                // Create FileInfo objects with just the path (minimal info from events)
+                const files: FileInfo[] = Array.from(paths).map(path => ({
+                    hashId: midhash256,
+                    filePath: path,
+                }));
+                groups.push({
+                    key: midhash256,
+                    files: files.sort((a, b) => a.filePath.localeCompare(b.filePath)),
+                });
+            }
+        }
+
+        // Sort by number of duplicates (descending)
+        return groups.sort((a, b) => b.files.length - a.files.length);
+    }
+
+    /**
+     * Get all hash-based duplicates (combines path-based midhash256 and SHA-256 duplicates)
+     * Path duplicates are detected from events, SHA-256 duplicates from fullhash plugin
      */
     getHashDuplicates(): DuplicateGroup[] {
         const groups: DuplicateGroup[] = [];
+        const seenKeys = new Set<string>();
 
+        // First, add path-based duplicates (from events, using midhash256)
+        for (const [midhash256, paths] of this.pathsByMidHash) {
+            if (paths.size > 1) {
+                seenKeys.add(midhash256);
+                const files: FileInfo[] = Array.from(paths).map(path => ({
+                    hashId: midhash256,
+                    filePath: path,
+                }));
+                groups.push({
+                    key: midhash256,
+                    files: files.sort((a, b) => a.filePath.localeCompare(b.filePath)),
+                });
+            }
+        }
+
+        // Then, add SHA-256 duplicates (from fullhash plugin)
+        // Only add if not already covered by path duplicates
         for (const [hash, hashIds] of this.byHash) {
-            if (hashIds.size > 1) {
+            if (hashIds.size > 1 && !seenKeys.has(hash)) {
                 const files = this.getFileInfos(hashIds);
                 groups.push({
                     key: hash,
@@ -253,13 +329,20 @@ export class DuplicateIndex {
     getStats(): DuplicateStats {
         const hashDuplicates = this.getHashDuplicates();
         const titleDuplicates = this.getTitleDuplicates();
+        const pathDuplicates = this.getPathDuplicates();
+
+        // Count unique paths tracked in pathsByMidHash
+        let pathsTracked = 0;
+        for (const paths of this.pathsByMidHash.values()) {
+            pathsTracked += paths.size;
+        }
 
         return {
             hashGroupCount: hashDuplicates.length,
             hashFileCount: hashDuplicates.reduce((sum, g) => sum + g.files.length, 0),
             titleGroupCount: titleDuplicates.length,
             titleFileCount: titleDuplicates.reduce((sum, g) => sum + g.files.length, 0),
-            totalFilesTracked: this.fileInfo.size,
+            totalFilesTracked: Math.max(this.fileInfo.size, pathsTracked),
             lastUpdated: this.lastUpdated.toISOString(),
         };
     }
@@ -282,6 +365,7 @@ export class DuplicateIndex {
     clear(): void {
         this.byHash.clear();
         this.byTitle.clear();
+        this.pathsByMidHash.clear();
         this.fileInfo.clear();
         this.lastUpdated = new Date();
         logger.info('DuplicateIndex cleared');

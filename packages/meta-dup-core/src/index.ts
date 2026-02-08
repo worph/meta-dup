@@ -53,22 +53,42 @@ async function handleStreamMessage(
             // Direct file events from meta-core
             case 'add':
             case 'change': {
-                // File added or changed - look up by path and update index
-                // Note: We need to wait for meta-sort to process the file first
-                // For now, just log - the duplicate index is rebuilt on startup
-                logger.debug(`File ${message.type}: ${message.path}`);
+                // File added or changed - track by midhash256 for duplicate detection
+                if (message.midhash256 && message.path) {
+                    duplicateIndex.addPath(message.midhash256, message.path);
+                    logger.debug(`File ${message.type}: ${message.path} (midhash: ${message.midhash256.substring(0, 12)}...)`);
+
+                    // Groundwork for title duplicates - try to get metadata if already processed
+                    const metadata = await redisClient.getFileByHashId(message.midhash256);
+                    if (metadata) {
+                        duplicateIndex.addFile(message.midhash256, metadata);
+                    }
+                } else {
+                    logger.debug(`File ${message.type}: ${message.path} (no midhash256)`);
+                }
                 break;
             }
 
             case 'delete': {
-                // File deleted - would need to find by path and remove
-                logger.debug(`File deleted: ${message.path}`);
+                // File deleted - remove from path tracking
+                if (message.midhash256 && message.path) {
+                    duplicateIndex.removePath(message.midhash256, message.path);
+                    logger.debug(`File deleted: ${message.path} (midhash: ${message.midhash256.substring(0, 12)}...)`);
+                } else {
+                    logger.debug(`File deleted: ${message.path} (no midhash256)`);
+                }
                 break;
             }
 
             case 'rename': {
-                // File renamed - treated as delete + add
-                logger.debug(`File renamed: ${message.oldPath} -> ${message.path}`);
+                // File renamed - update path tracking
+                if (message.midhash256 && message.oldPath && message.path) {
+                    duplicateIndex.removePath(message.midhash256, message.oldPath);
+                    duplicateIndex.addPath(message.midhash256, message.path);
+                    logger.debug(`File renamed: ${message.oldPath} -> ${message.path} (midhash: ${message.midhash256.substring(0, 12)}...)`);
+                } else {
+                    logger.debug(`File renamed: ${message.oldPath} -> ${message.path} (no midhash256)`);
+                }
                 break;
             }
 
