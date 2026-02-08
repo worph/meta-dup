@@ -415,4 +415,85 @@ export class DuplicateIndex {
             }
         }
     }
+
+    /**
+     * Update title index for a specific file when metadata changes
+     * Called by MetaEventConsumer when title-related fields are updated
+     */
+    async updateTitleForFile(hashId: string, redisClient: RedisClient): Promise<void> {
+        const currentInfo = this.fileInfo.get(hashId);
+        const oldTitleKey = currentInfo ? this.getTitleKeyFromInfo(currentInfo) : null;
+
+        // Fetch updated metadata from Redis
+        const metadata = await redisClient.getFileByHashId(hashId);
+
+        if (!metadata) {
+            // File deleted - remove from title index
+            if (oldTitleKey) {
+                this.removeFromTitleIndex(hashId, oldTitleKey);
+                logger.debug(`Removed deleted file ${hashId} from title index`);
+            }
+            return;
+        }
+
+        const newTitleKey = this.getTitleKey(metadata);
+
+        // Only update if title key changed
+        if (oldTitleKey !== newTitleKey) {
+            if (oldTitleKey) {
+                this.removeFromTitleIndex(hashId, oldTitleKey);
+            }
+            if (newTitleKey) {
+                this.addToTitleIndex(hashId, newTitleKey);
+            }
+            // Update cached file info
+            this.addFile(hashId, metadata);
+            logger.debug(`Title updated for ${hashId}: "${oldTitleKey}" -> "${newTitleKey}"`);
+        }
+
+        this.lastUpdated = new Date();
+    }
+
+    /**
+     * Get normalized title key from FileInfo
+     */
+    private getTitleKeyFromInfo(info: FileInfo): string | null {
+        if (!info.title) return null;
+
+        let key = info.title.toLowerCase().trim();
+
+        if (info.year) {
+            key += `:${info.year}`;
+        }
+        if (info.season !== undefined) {
+            key += `:s${info.season}`;
+        }
+        if (info.episode !== undefined) {
+            key += `:e${info.episode}`;
+        }
+
+        return key;
+    }
+
+    /**
+     * Remove a file from the title index by key
+     */
+    private removeFromTitleIndex(hashId: string, titleKey: string): void {
+        const titleSet = this.byTitle.get(titleKey);
+        if (titleSet) {
+            titleSet.delete(hashId);
+            if (titleSet.size === 0) {
+                this.byTitle.delete(titleKey);
+            }
+        }
+    }
+
+    /**
+     * Add a file to the title index by key
+     */
+    private addToTitleIndex(hashId: string, titleKey: string): void {
+        const titleSet = this.byTitle.get(titleKey) ?? new Set();
+        titleSet.add(hashId);
+        this.byTitle.set(titleKey, titleSet);
+    }
 }

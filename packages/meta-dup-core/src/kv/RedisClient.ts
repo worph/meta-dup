@@ -730,4 +730,38 @@ export class RedisClient implements Partial<IKVClient> {
     getRawClient(): Redis | null {
         return this.client;
     }
+
+    /**
+     * Create a duplicate Redis connection for blocking stream consumers.
+     * Each blocking consumer needs its own connection since XREADGROUP blocks.
+     *
+     * The caller is responsible for closing this connection.
+     */
+    createDuplicateConnection(): Redis | null {
+        if (!this.isConnected) {
+            logger.warn('Cannot create duplicate connection: not connected');
+            return null;
+        }
+
+        try {
+            const connection = new Redis(this.config.url, {
+                retryStrategy: (times: number) => {
+                    if (times > 10) {
+                        return null;
+                    }
+                    return Math.min(times * 500, 5000);
+                },
+                maxRetriesPerRequest: 3,
+            });
+
+            connection.on('error', (err: Error) => {
+                logger.error('Duplicate Redis connection error:', err.message);
+            });
+
+            return connection;
+        } catch (error) {
+            logger.error('Failed to create duplicate connection:', error);
+            return null;
+        }
+    }
 }

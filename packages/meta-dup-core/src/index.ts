@@ -10,11 +10,14 @@
  */
 
 import 'dotenv/config';
+import * as os from 'os';
+import { Redis } from 'ioredis';
 import { Logger } from 'tslog';
 import { KVManager } from './kv/KVManager.js';
 import { RedisClient, StreamMessage } from './kv/RedisClient.js';
 import { DuplicateIndex } from './DuplicateIndex.js';
 import { APIServer } from './api/APIServer.js';
+import { MetaEventConsumer } from './MetaEventConsumer.js';
 
 const logger = new Logger({ name: 'meta-dup' });
 
@@ -169,15 +172,25 @@ async function main(): Promise<void> {
     let redisClient: RedisClient | null = null;
     let duplicateIndex: DuplicateIndex | null = null;
     let apiServer: APIServer | null = null;
+    let metaEventConsumer: MetaEventConsumer | null = null;
+    let metaRedis: Redis | null = null;
 
     // Graceful shutdown
     const shutdown = async (signal: string): Promise<void> => {
         logger.info(`Received ${signal}, shutting down...`);
 
         try {
-            // Stop stream consumer first
+            // Stop stream consumers first
+            if (metaEventConsumer) {
+                metaEventConsumer.stop();
+            }
             if (redisClient) {
                 redisClient.stopStreamConsumer();
+            }
+            // Close meta:events Redis connection
+            if (metaRedis) {
+                await metaRedis.quit();
+                metaRedis = null;
             }
             if (apiServer) await apiServer.stop();
             await kvManager.stop();
@@ -238,6 +251,24 @@ async function main(): Promise<void> {
             ).catch(error => {
                 logger.error('Stream consumer error:', error);
             });
+
+            // Start meta:events consumer for title updates
+            // This catches metadata changes from plugins like TMDB
+            metaRedis = redisClient.createDuplicateConnection();
+            if (metaRedis) {
+                const consumerName = `${os.hostname()}-${process.pid}-meta`;
+                metaEventConsumer = new MetaEventConsumer(
+                    metaRedis,
+                    consumerName,
+                    async (hashId: string) => {
+                        await duplicateIndex!.updateTitleForFile(hashId, redisClient!);
+                    }
+                );
+                await metaEventConsumer.start();
+                logger.info('meta:events consumer started for title updates');
+            } else {
+                logger.warn('Could not create meta:events consumer - title updates will not be tracked');
+            }
 
             // Initialize API server
             apiServer = new APIServer(duplicateIndex, {
