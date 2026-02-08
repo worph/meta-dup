@@ -27,7 +27,7 @@ export interface StreamMessage {
     // Direct file event fields (from meta-core)
     path?: string;
     size?: string;
-    partialHash?: string;
+    midhash256?: string;  // midhash256 CID computed by meta-core
     oldPath?: string;
     // Legacy payload field (for backward compatibility)
     payload?: string;
@@ -657,7 +657,7 @@ export class RedisClient implements Partial<IKVClient> {
             type: fieldMap.type as StreamMessage['type'],
             path: fieldMap.path,
             size: fieldMap.size,
-            partialHash: fieldMap.partialHash,
+            midhash256: fieldMap.midhash256,
             oldPath: fieldMap.oldPath,
             payload: fieldMap.payload,
             timestamp: fieldMap.timestamp || '0',
