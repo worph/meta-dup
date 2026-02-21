@@ -32,6 +32,7 @@ export interface URLsResponse {
     apiUrl: string;
     redisUrl: string;
     webdavUrl: string;
+    webdavUrlInternal: string;
     isLeader: boolean;
 }
 
@@ -120,6 +121,7 @@ export class LeaderClient {
                 apiUrl: urls.apiUrl,
                 redisUrl: urls.redisUrl,
                 webdavUrl: urls.webdavUrl,
+                webdavUrlInternal: urls.webdavUrlInternal,
                 timestamp: Date.now(),
                 pid: 0 // Unknown for remote leader
             };
@@ -139,11 +141,20 @@ export class LeaderClient {
     }
 
     /**
-     * Get WebDAV URL from leader info
+     * Get WebDAV URL from leader info (external, via nginx/HTTPS)
      */
     async getWebdavUrl(): Promise<string | null> {
         const info = await this.getLeaderInfo();
         return info?.webdavUrl ?? null;
+    }
+
+    /**
+     * Get internal WebDAV URL from leader info (direct to port 9000)
+     * Use this for container-to-container communication
+     */
+    async getWebdavUrlInternal(): Promise<string | null> {
+        const info = await this.getLeaderInfo();
+        return info?.webdavUrlInternal ?? null;
     }
 
     /**

@@ -74,8 +74,11 @@ export interface LeaderLockInfo {
     /** Redis connection URL (e.g., redis://10.0.1.50:6379) */
     redisUrl: string;
 
-    /** WebDAV URL for file access */
+    /** WebDAV URL for file access (external, via nginx/HTTPS) */
     webdavUrl: string;
+
+    /** WebDAV URL for internal container-to-container access (direct to port 9000) */
+    webdavUrlInternal: string;
 
     /** Timestamp when leadership was acquired */
     timestamp: number;
