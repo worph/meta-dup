@@ -13,7 +13,7 @@
 import { hostname } from 'os';
 import { Logger } from 'tslog';
 import { LeaderClient } from './LeaderClient.js';
-import { ServiceDiscovery } from './ServiceDiscovery.js';
+import { ServiceRegistration } from './ServiceRegistration.js';
 import { RedisClient } from './RedisClient.js';
 import type { LeaderLockInfo } from './IKVClient.js';
 
@@ -48,7 +48,7 @@ interface KVManagerConfig {
 export class KVManager {
     private config: Required<KVManagerConfig>;
     private leaderClient: LeaderClient | null = null;
-    private serviceDiscovery: ServiceDiscovery | null = null;
+    private serviceRegistration: ServiceRegistration | null = null;
     private redisClient: RedisClient | null = null;
     private isStarted = false;
     private isShuttingDown = false;
@@ -80,14 +80,14 @@ export class KVManager {
 
         logger.info(`Starting KVManager for ${this.config.serviceName}...`);
 
-        // Initialize and start service discovery for registration and heartbeat
+        // Initialize and start service registration for heartbeat
         const apiUrl = this.config.baseUrl || `http://${hostname()}:${this.config.apiPort}`;
-        this.serviceDiscovery = new ServiceDiscovery({
+        this.serviceRegistration = new ServiceRegistration({
             metaCorePath: this.config.metaCorePath,
             serviceName: this.config.serviceName,
             apiUrl
         });
-        await this.serviceDiscovery.start();
+        await this.serviceRegistration.start();
 
         // If direct Redis URL provided, skip leader discovery
         if (this.config.redisUrl) {
@@ -162,10 +162,10 @@ export class KVManager {
             this.leaderClient = null;
         }
 
-        // Stop service discovery (if it was started)
-        if (this.serviceDiscovery) {
-            await this.serviceDiscovery.stop();
-            this.serviceDiscovery = null;
+        // Stop service registration (if it was started)
+        if (this.serviceRegistration) {
+            await this.serviceRegistration.stop();
+            this.serviceRegistration = null;
         }
 
         // Disconnect Redis
@@ -341,10 +341,10 @@ export class KVManager {
     }
 
     /**
-     * Get service discovery (for inter-service navigation)
+     * Get service registration instance
      */
-    getServiceDiscovery(): ServiceDiscovery | null {
-        return this.serviceDiscovery;
+    getServiceRegistration(): ServiceRegistration | null {
+        return this.serviceRegistration;
     }
 
     /**

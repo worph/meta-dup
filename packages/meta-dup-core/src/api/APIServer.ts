@@ -153,40 +153,7 @@ export class APIServer {
             };
         });
 
-        // Service discovery (for dashboard navigation)
-        this.app.get('/api/services', async (request: FastifyRequest, reply: FastifyReply) => {
-            const services: Array<{
-                name: string;
-                url: string;
-                api: string;
-                status: string;
-                role?: string;
-            }> = [];
-
-            try {
-                const serviceDiscovery = this.kvManager.getServiceDiscovery();
-                if (serviceDiscovery) {
-                    const allServices = await serviceDiscovery.discoverAllServices();
-
-                    for (const svc of allServices) {
-                        services.push({
-                            name: svc.name || 'Unknown',
-                            url: svc.baseUrl || '',
-                            api: svc.baseUrl || '',
-                            status: svc.status || 'unknown',
-                            role: svc.role,
-                        });
-                    }
-                }
-            } catch (error: any) {
-                logger.error('Error discovering services:', error);
-            }
-
-            return {
-                services,
-                current: 'meta-dup',
-            };
-        });
+        // Note: /api/services is handled by nginx proxy to meta-core (centralized service discovery)
 
         // Catch-all for SPA routing (serve index.html for non-API routes)
         this.app.setNotFoundHandler(async (request: FastifyRequest, reply: FastifyReply) => {

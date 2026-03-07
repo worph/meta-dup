@@ -2,12 +2,10 @@ import { useState, useEffect } from 'react';
 
 interface ServiceInfo {
   name: string;
-  url: string;
-  api: string;
+  hostname: string;
+  baseUrl: string;
   status: string;
-  capabilities: string[];
-  version: string;
-  role?: string; // "leader", "follower", or undefined (for non-meta-core services)
+  lastHeartbeat: string;
 }
 
 interface ServicesResponse {
@@ -19,6 +17,7 @@ const serviceIcons: Record<string, string> = {
   'meta-sort': '📁',
   'meta-fuse': '🗂️',
   'meta-stremio': '🎬',
+  'meta-core': '⚙️',
   'meta-dup': '🔍',
   'meta-orbit': '🌐',
   'default': '📦'
@@ -57,11 +56,7 @@ function ServiceNav() {
 
   if (loading) return null;
 
-  // Filter out follower meta-core instances (only show leader)
-  const filteredServices = services.filter(
-    s => s.name !== 'meta-core' || s.role === 'leader'
-  );
-  const sortedServices = [...filteredServices].sort((a, b) => a.name.localeCompare(b.name));
+  const sortedServices = [...services].sort((a, b) => a.name.localeCompare(b.name));
 
   if (sortedServices.length === 0) return null;
 
@@ -75,12 +70,12 @@ function ServiceNav() {
           return (
             <a
               key={service.name}
-              href={isActive ? '#' : service.url}
+              href={isActive ? '#' : service.baseUrl}
               className={`service-link${isActive ? ' active' : ''}`}
               onClick={(e) => {
                 e.preventDefault();
                 if (!isActive) {
-                  window.location.href = service.url;
+                  window.location.href = service.baseUrl;
                 }
               }}
             >

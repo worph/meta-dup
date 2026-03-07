@@ -1,2 +1,4 @@
 node_modules
 packages/meta-dup-core/dist
+packages/meta-dup-ui/dist
+packages/meta-dup-ui/node_modules

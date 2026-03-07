@@ -1,11 +1,11 @@
 /**
- * Service Discovery using shared filesystem
+ * Service Registration using shared filesystem
  *
  * Each service registers itself in /meta-core/services/{service-name}-{hostname}.json
  * with its base URL, status, and heartbeat timestamp.
  *
- * Services can discover each other by reading these JSON files.
- * Stale detection: if lastHeartbeat > 60 seconds ago, service is considered stale.
+ * Service discovery is centralized in meta-core - this class only handles registration.
+ * For service discovery, use the /api/services endpoint (proxied to meta-core via nginx).
  *
  * Each service must call start() to register itself and begin heartbeat updates.
  * meta-core runs a cleanup process that removes services with stale heartbeats.
@@ -13,13 +13,12 @@
 
 import { promises as fs } from 'fs';
 import { hostname } from 'os';
-import { join } from 'path';
 import { Logger } from 'tslog';
 import type { ServiceInfo } from './IKVClient.js';
 
-const logger = new Logger({ name: 'ServiceDiscovery' });
+const logger = new Logger({ name: 'ServiceRegistration' });
 
-interface ServiceDiscoveryConfig {
+interface ServiceRegistrationConfig {
     /** Path to META_CORE_VOLUME (e.g., /meta-core) */
     metaCorePath: string;
 
@@ -36,8 +35,8 @@ interface ServiceDiscoveryConfig {
     staleThreshold?: number;
 }
 
-export class ServiceDiscovery {
-    private config: ServiceDiscoveryConfig;
+export class ServiceRegistration {
+    private config: ServiceRegistrationConfig;
     private servicesDir: string;
     private serviceFilePath: string;
     private heartbeatTimer: NodeJS.Timeout | null = null;
@@ -45,7 +44,7 @@ export class ServiceDiscovery {
     private isStarted = false;
     private currentHostname: string;
 
-    constructor(config: ServiceDiscoveryConfig) {
+    constructor(config: ServiceRegistrationConfig) {
         this.config = {
             heartbeatInterval: 30000,
             staleThreshold: 60000,
@@ -164,125 +163,6 @@ export class ServiceDiscovery {
             if (error.code !== 'ENOENT') {
                 logger.error('Failed to unregister:', error);
             }
-        }
-    }
-
-    /**
-     * Check if a service info is stale
-     */
-    private isStale(info: ServiceInfo): boolean {
-        const lastHeartbeat = new Date(info.lastHeartbeat).getTime();
-        return Date.now() - lastHeartbeat > this.config.staleThreshold!;
-    }
-
-    // ========================================================================
-    // Discovery Methods
-    // ========================================================================
-
-    /**
-     * Discover a service by name
-     * Looks for files matching pattern: {name}-*.json (hostname-based naming)
-     */
-    async discoverService(name: string): Promise<ServiceInfo | null> {
-        try {
-            // First try exact match for backward compatibility
-            const exactPath = join(this.servicesDir, `${name}.json`);
-            try {
-                const content = await fs.readFile(exactPath, 'utf-8');
-                const service = JSON.parse(content) as ServiceInfo;
-
-                if (this.isStale(service)) {
-                    service.status = 'stale';
-                }
-
-                return service.status === 'running' ? service : null;
-            } catch {
-                // Try hostname-based files
-            }
-
-            // Search for hostname-based files: name-*.json
-            const files = await fs.readdir(this.servicesDir);
-            const matchingFiles = files.filter(f =>
-                f.startsWith(`${name}-`) && f.endsWith('.json')
-            );
-
-            // Return first valid (non-stale) service
-            for (const file of matchingFiles) {
-                const filePath = join(this.servicesDir, file);
-                const content = await fs.readFile(filePath, 'utf-8');
-                const service = JSON.parse(content) as ServiceInfo;
-
-                if (this.isStale(service)) {
-                    service.status = 'stale';
-                    continue; // Skip stale services
-                }
-
-                if (service.status === 'running') {
-                    return service;
-                }
-            }
-
-            return null;
-        } catch (error: any) {
-            if (error.code === 'ENOENT') {
-                return null; // Service not registered
-            }
-            throw error;
-        }
-    }
-
-    /**
-     * Discover all registered services
-     */
-    async discoverAllServices(): Promise<ServiceInfo[]> {
-        try {
-            const files = await fs.readdir(this.servicesDir);
-            const services: ServiceInfo[] = [];
-
-            for (const file of files) {
-                if (!file.endsWith('.json')) continue;
-
-                const filePath = join(this.servicesDir, file);
-                try {
-                    const content = await fs.readFile(filePath, 'utf-8');
-                    const service = JSON.parse(content) as ServiceInfo;
-
-                    if (this.isStale(service)) {
-                        service.status = 'stale';
-                    }
-
-                    services.push(service);
-                } catch (error) {
-                    logger.error(`Failed to read ${file}:`, error);
-                }
-            }
-
-            return services;
-        } catch (error: any) {
-            if (error.code === 'ENOENT') {
-                return []; // Services directory doesn't exist yet
-            }
-            throw error;
-        }
-    }
-
-    /**
-     * Check if a service is healthy
-     */
-    async isServiceHealthy(name: string): Promise<boolean> {
-        const service = await this.discoverService(name);
-        if (!service) return false;
-
-        // Try to ping the service's health endpoint
-        const url = `${service.baseUrl}/health`;
-
-        try {
-            const response = await fetch(url, {
-                signal: AbortSignal.timeout(5000)
-            });
-            return response.ok;
-        } catch {
-            return false;
         }
     }
 
