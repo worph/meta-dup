@@ -61,13 +61,13 @@ pnpm build
 ### Run (in Docker dev environment)
 ```bash
 cd dev
-./start.sh  # Starts all services including meta-dup
+./scripts/start.sh  # Starts all services including meta-dup
 ```
 
 ### Rebuild
 ```bash
 cd dev
-./reload-meta-dup.sh
+./scripts/reload-meta-dup.sh
 ```
 
 ### Tests
