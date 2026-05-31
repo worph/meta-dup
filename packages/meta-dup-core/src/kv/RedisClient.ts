@@ -15,6 +15,68 @@ import type { IKVClient, KeyValuePair } from './IKVClient.js';
 
 const logger = new Logger({ name: 'RedisClient' });
 
+// --- bare-CID key-set decoding -------------------------------------------
+// Sibling CIDs live on the record as a key-set `cids/<cid> = "true"` (no
+// per-algorithm field name). A CIDv1 is self-describing — its algorithm is
+// the multicodec — so we decode each member's multihash code to pick the
+// digest we need: sha2-256 (0x12) is the full-file content hash used for
+// exact-duplicate detection; midhash256 (0x1000) is the record address.
+// Self-contained decoder (no multiformats dep). See METADATA_KEYS.md §2/§14.13.
+const MH_SHA256 = 0x12;
+const MH_MIDHASH256 = 0x1000;
+const CID_B32_ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567';
+
+function decodeBase32Lower(s: string): Uint8Array | null {
+    let bits = 0, value = 0;
+    const out: number[] = [];
+    for (const ch of s) {
+        const idx = CID_B32_ALPHABET.indexOf(ch);
+        if (idx < 0) return null;
+        value = (value << 5) | idx;
+        bits += 5;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push((value >> bits) & 0xff);
+        }
+    }
+    return new Uint8Array(out);
+}
+
+function readUvarint(buf: Uint8Array, pos: number): [number, number] {
+    let result = 0, shift = 0, p = pos;
+    while (p < buf.length) {
+        const b = buf[p++];
+        result |= (b & 0x7f) << shift;
+        if ((b & 0x80) === 0) return [result >>> 0, p];
+        shift += 7;
+    }
+    return [0, pos];
+}
+
+/** Multihash code of a bare multibase-base32 CIDv1, or null. */
+function cidMultihashCode(cid: string): number | null {
+    if (!cid.startsWith('b')) return null;
+    const bytes = decodeBase32Lower(cid.slice(1));
+    if (!bytes || bytes.length < 3) return null;
+    let v: number, pos = 0;
+    [v, pos] = readUvarint(bytes, pos); // version
+    if (v !== 1) return null;
+    [v, pos] = readUvarint(bytes, pos); // codec (ignored)
+    [v, pos] = readUvarint(bytes, pos); // multihash code
+    return v;
+}
+
+/** Pick the sibling CID with the given multihash code from a record's
+ *  `cids/<cid>` key-set. */
+function pickCidByMulticodec(data: Record<string, any>, mhCode: number): string | undefined {
+    for (const key of Object.keys(data)) {
+        if (!key.startsWith('cids/')) continue;
+        const cid = key.slice('cids/'.length);
+        if (cid && cidMultihashCode(cid) === mhCode) return cid;
+    }
+    return undefined;
+}
+
 /**
  * Stream message from Redis Streams
  * Supports both:
@@ -398,9 +460,12 @@ export class RedisClient implements Partial<IKVClient> {
             mtime,
             ctime: data.ctime ? parseFloat(data.ctime) : mtime,
 
-            // Identification
-            hashId: hashId ?? data.cid_midhash256 ?? data.hashId,
-            sha256: data['cid_sha2-256'] ?? data.sha256,
+            // Identification. The midhash (record address) and the full-file
+            // sha2-256 (exact-dup key) are recovered from the bare-CID
+            // key-set by multicodec; legacy named fields kept as a
+            // transition fallback. See METADATA_KEYS.md §2/§14.13.
+            hashId: hashId ?? pickCidByMulticodec(data, MH_MIDHASH256) ?? data.cid_midhash256 ?? data.hashId,
+            sha256: pickCidByMulticodec(data, MH_SHA256) ?? data['cid_sha2-256'] ?? data.sha256,
 
             // Title information
             title: data.title,
