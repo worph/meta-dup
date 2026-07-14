@@ -461,11 +461,14 @@ export class RedisClient implements Partial<IKVClient> {
             ctime: data.ctime ? parseFloat(data.ctime) : mtime,
 
             // Identification. The midhash (record address) and the full-file
-            // sha2-256 (exact-dup key) are recovered from the bare-CID
-            // key-set by multicodec; legacy named fields kept as a
-            // transition fallback. See METADATA_KEYS.md §2/§14.13.
-            hashId: hashId ?? pickCidByMulticodec(data, MH_MIDHASH256) ?? data.cid_midhash256 ?? data.hashId,
-            sha256: pickCidByMulticodec(data, MH_SHA256) ?? data['cid_sha2-256'] ?? data.sha256,
+            // sha2-256 (exact-dup key) are recovered from the bare-CID key-set by
+            // multicodec. The legacy `cid_midhash256` / `cid_sha2-256` fallbacks
+            // are gone: meta-core rejects those fields at the write boundary now
+            // (400), because a `cid_*` field is stored but never reverse-indexed —
+            // a record carrying one is unresolvable by that CID. There is nothing
+            // left to fall back to. See METADATA_KEYS.md §2/§14.13.
+            hashId: hashId ?? pickCidByMulticodec(data, MH_MIDHASH256) ?? data.hashId,
+            sha256: pickCidByMulticodec(data, MH_SHA256) ?? data.sha256,
 
             // Title information
             title: data.title,
