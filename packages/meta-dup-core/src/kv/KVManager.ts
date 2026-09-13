@@ -13,7 +13,6 @@
 import { hostname } from 'os';
 import { Logger } from 'tslog';
 import { LeaderClient } from './LeaderClient.js';
-import { ServiceRegistration } from './ServiceRegistration.js';
 import { RedisClient } from './RedisClient.js';
 import type { LeaderLockInfo } from './IKVClient.js';
 
@@ -48,7 +47,6 @@ interface KVManagerConfig {
 export class KVManager {
     private config: Required<KVManagerConfig>;
     private leaderClient: LeaderClient | null = null;
-    private serviceRegistration: ServiceRegistration | null = null;
     private redisClient: RedisClient | null = null;
     private isStarted = false;
     private isShuttingDown = false;
@@ -80,14 +78,10 @@ export class KVManager {
 
         logger.info(`Starting KVManager for ${this.config.serviceName}...`);
 
-        // Initialize and start service registration for heartbeat
+        // No separate service registration step any more: the LeaderClient's
+        // discovery node announces this service on the same UDP group it
+        // listens on, so being discoverable and discovering are one thing.
         const apiUrl = this.config.baseUrl || `http://${hostname()}:${this.config.apiPort}`;
-        this.serviceRegistration = new ServiceRegistration({
-            metaCorePath: this.config.metaCorePath,
-            serviceName: this.config.serviceName,
-            apiUrl
-        });
-        await this.serviceRegistration.start();
 
         // If direct Redis URL provided, skip leader discovery
         if (this.config.redisUrl) {
@@ -99,8 +93,9 @@ export class KVManager {
 
         // Use leader client
         this.leaderClient = new LeaderClient({
-            metaCorePath: this.config.metaCorePath,
-            metaCoreUrl: this.config.metaCoreUrl || undefined
+            metaCoreUrl: this.config.metaCoreUrl || undefined,
+            serviceName: this.config.serviceName,
+            baseUrl: apiUrl,
         });
 
         // Set up leader change callback
@@ -163,10 +158,6 @@ export class KVManager {
         }
 
         // Stop service registration (if it was started)
-        if (this.serviceRegistration) {
-            await this.serviceRegistration.stop();
-            this.serviceRegistration = null;
-        }
 
         // Disconnect Redis
         await this.disconnectRedis();
@@ -343,8 +334,9 @@ export class KVManager {
     /**
      * Get service registration instance
      */
-    getServiceRegistration(): ServiceRegistration | null {
-        return this.serviceRegistration;
+    /** @deprecated File-based registration is gone; always null. */
+    getServiceRegistration(): null {
+        return null;
     }
 
     /**

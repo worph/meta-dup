@@ -1,29 +1,48 @@
 /**
- * LeaderClient - Client for reading leader info from meta-core
+ * LeaderClient - locates meta-core and exposes its URLs.
  *
- * This replaces the old LeaderDiscovery.ts by delegating leader election
- * to meta-core (Go sidecar) and just reading the results.
+ * Since meta-discovery v1 this is a thin adapter over MetaCoreLocator
+ * (../discovery/meshdisco.js): meta-core is found by UDP announce instead of by
+ * reading /meta-core/locks/kv-leader.info, which means this service no longer
+ * needs the /meta-core volume mounted at all.
  *
- * Features:
- * - Reads kv-leader.info file for leader URLs
- * - Calls meta-core /urls API for current leader URLs
- * - Watches for leader changes via file system watcher
+ * The public surface is deliberately unchanged so KVManager and its callers did
+ * not have to move: getLeaderInfo / getUrls / getApiUrl / getWebdavUrl*,
+ * waitForLeader (same 30s default), startWatching / onChange (the fs.watch on
+ * the lock dir became "an announce arrived carrying a different apiUrl").
+ *
+ * Precedence is the pin: when metaCoreUrl (META_CORE_URL) is set it always
+ * wins and the wire is never consulted for core selection. See
+ * docs/project-architecture/service-discovery.md.
+ *
+ * The name "leader" is legacy: meta-core's flock election is vestigial, and
+ * redisUrl has been empty since the api-mediated-access lockdown.
  */
 
-import { promises as fs } from 'fs';
-import { watch, FSWatcher } from 'fs';
-import { dirname } from 'path';
 import { Logger } from 'tslog';
+import { MetaCoreLocator, type MeshNeighbor } from '../discovery/meshdisco.js';
 import type { LeaderLockInfo } from './IKVClient.js';
 
 const logger = new Logger({ name: 'LeaderClient' });
 
 export interface LeaderClientConfig {
-    /** Path to META_CORE_VOLUME (e.g., /meta-core) */
-    metaCorePath: string;
+    /**
+     * @deprecated Unused since meta-discovery v1. Kept so existing callers
+     * compile unchanged; nothing reads the volume any more.
+     */
+    metaCorePath?: string;
 
-    /** meta-core API URL (e.g., http://meta-core:9000 or http://localhost:9000) */
+    /** meta-core API URL. When set, discovery never overrides it. */
     metaCoreUrl?: string;
+
+    /** This service's name, used for its own announce. */
+    serviceName?: string;
+
+    /** Browser-facing URL announced for the nav menu. */
+    baseUrl?: string;
+
+    /** Service version, display only. */
+    version?: string;
 }
 
 export interface URLsResponse {
@@ -38,57 +57,75 @@ export interface URLsResponse {
 
 export class LeaderClient {
     private config: LeaderClientConfig;
-    private infoFilePath: string;
+    private locator: MetaCoreLocator;
     private leaderInfo: LeaderLockInfo | null = null;
-    private watcher: FSWatcher | null = null;
     private onChangeCallbacks: (() => void)[] = [];
+    private started = false;
 
-    // URL caching
+    // Only used on the pinned path, where URLs still come from GET /urls.
+    // A discovered core carries them in the announce itself.
     private cachedUrls: URLsResponse | null = null;
     private urlsCacheTime: number = 0;
-    private readonly urlsCacheTTL: number = 5000; // 5 seconds
+    private readonly urlsCacheTTL: number = 5000;
 
     constructor(config: LeaderClientConfig) {
         this.config = config;
-        this.infoFilePath = `${config.metaCorePath}/locks/kv-leader.info`;
+        this.locator = new MetaCoreLocator({
+            serviceName: config.serviceName ?? 'meta-dup',
+            baseUrl: config.baseUrl,
+            version: config.version,
+            metaCoreUrl: config.metaCoreUrl,
+            enabled: process.env.ENABLE_UDP_DISCOVERY !== 'false' &&
+                process.env.ENABLE_UDP_DISCOVERY !== '0',
+        });
+        this.locator.onChange(() => {
+            this.cachedUrls = null;
+            this.urlsCacheTime = 0;
+            this.notifyChange();
+        });
+    }
+
+    private async ensureStarted(): Promise<void> {
+        if (this.started) return;
+        this.started = true;
+        await this.locator.start();
     }
 
     /**
-     * Read API URL from file (plain text format)
+     * Guard against a rollback reintroducing direct Redis exposure.
+     * api-mediated-access PR D removed redisUrl; ALLOW_LEGACY_REDIS_URL=1
+     * downgrades this to a warning during a deliberate temporary rollback.
      */
-    private async getApiUrlFromFile(): Promise<string | null> {
-        try {
-            const content = await fs.readFile(this.infoFilePath, 'utf-8');
-            return content.trim() || null;
-        } catch (error: any) {
-            logger.error(`Failed to read API URL from file: ${error.message}`);
-            return null;
+    private assertNoRedisUrl(redisUrl: string | undefined): void {
+        if (!redisUrl) return;
+        const msg =
+            'meta-core still publishes redisUrl; direct Redis access was retired ' +
+            'by the api-mediated-access lockdown. Verify meta-core version.';
+        if (process.env.ALLOW_LEGACY_REDIS_URL === '1') {
+            logger.warn('WARNING: ' + msg);
+        } else {
+            throw new Error(msg);
         }
     }
 
-    /**
-     * Fetch URLs from meta-core /urls API with caching
-     */
     private async fetchUrls(apiUrl: string): Promise<URLsResponse | null> {
-        // Check cache
         const now = Date.now();
         if (this.cachedUrls && (now - this.urlsCacheTime) < this.urlsCacheTTL) {
             return this.cachedUrls;
         }
-
         try {
             const response = await fetch(`${apiUrl}/urls`, {
                 method: 'GET',
                 headers: { 'Accept': 'application/json' },
                 signal: AbortSignal.timeout(5000)
             });
-
             if (!response.ok) {
                 logger.error(`Failed to fetch URLs: ${response.status} ${response.statusText}`);
                 return null;
             }
-
-            this.cachedUrls = await response.json() as URLsResponse;
+            const parsed = await response.json() as URLsResponse;
+            this.assertNoRedisUrl(parsed.redisUrl);
+            this.cachedUrls = parsed;
             this.urlsCacheTime = now;
             return this.cachedUrls;
         } catch (error: any) {
@@ -98,23 +135,37 @@ export class LeaderClient {
     }
 
     /**
-     * Read leader info from file and /urls API
+     * Resolve meta-core's URLs — straight from the announce when discovered
+     * (no HTTP hop needed), or over HTTP when pinned.
      */
+    async getUrls(): Promise<URLsResponse | null> {
+        await this.ensureStarted();
+
+        const wire = this.locator.getUrls();
+        if (wire && !this.config.metaCoreUrl) {
+            return {
+                hostname: wire.hostname,
+                baseUrl: wire.baseUrl,
+                apiUrl: wire.apiUrl,
+                redisUrl: '',
+                webdavUrl: wire.webdavUrl,
+                webdavUrlInternal: wire.webdavUrlInternal,
+                isLeader: true,
+            };
+        }
+
+        const apiUrl = this.locator.getApiUrl();
+        if (!apiUrl) {
+            logger.error('No meta-core API URL available');
+            return null;
+        }
+        return this.fetchUrls(apiUrl);
+    }
+
     async getLeaderInfo(): Promise<LeaderLockInfo | null> {
         try {
-            // Read API URL from file (plain text)
-            const apiUrl = await this.getApiUrlFromFile();
-            if (!apiUrl) {
-                return null;
-            }
-
-            // Fetch full info from /urls API
-            const urls = await this.fetchUrls(apiUrl);
-            if (!urls) {
-                return null;
-            }
-
-            // Convert URLsResponse to LeaderLockInfo
+            const urls = await this.getUrls();
+            if (!urls) return null;
             this.leaderInfo = {
                 hostname: urls.hostname,
                 baseUrl: urls.baseUrl,
@@ -123,7 +174,7 @@ export class LeaderClient {
                 webdavUrl: urls.webdavUrl,
                 webdavUrlInternal: urls.webdavUrlInternal,
                 timestamp: Date.now(),
-                pid: 0 // Unknown for remote leader
+                pid: 0
             };
             return this.leaderInfo;
         } catch (error: any) {
@@ -132,138 +183,64 @@ export class LeaderClient {
         }
     }
 
-    /**
-     * Get Redis URL from leader info
-     */
     async getRedisUrl(): Promise<string | null> {
-        const info = await this.getLeaderInfo();
-        return info?.redisUrl ?? null;
+        return (await this.getLeaderInfo())?.redisUrl ?? null;
     }
 
-    /**
-     * Get WebDAV URL from leader info (external, via nginx/HTTPS)
-     */
     async getWebdavUrl(): Promise<string | null> {
-        const info = await this.getLeaderInfo();
-        return info?.webdavUrl ?? null;
+        return (await this.getLeaderInfo())?.webdavUrl ?? null;
     }
 
-    /**
-     * Get internal WebDAV URL from leader info (direct to port 9000)
-     * Use this for container-to-container communication
-     */
+    /** Internal WebDAV URL — use for container-to-container access. */
     async getWebdavUrlInternal(): Promise<string | null> {
-        const info = await this.getLeaderInfo();
-        return info?.webdavUrlInternal ?? null;
+        return (await this.getLeaderInfo())?.webdavUrlInternal ?? null;
     }
 
-    /**
-     * Get meta-core API URL from leader info
-     */
     async getApiUrl(): Promise<string | null> {
-        const info = await this.getLeaderInfo();
-        return info?.apiUrl ?? null;
+        return (await this.getLeaderInfo())?.apiUrl ?? null;
     }
 
     /**
-     * Call meta-core /urls API to get current URLs
-     * Useful for getting URLs when you don't want to read the file directly
-     */
-    async getUrls(): Promise<URLsResponse | null> {
-        // First try using configured metaCoreUrl
-        let apiUrl: string | null = this.config.metaCoreUrl ?? null;
-
-        // Fall back to reading from file
-        if (!apiUrl) {
-            apiUrl = await this.getApiUrlFromFile();
-        }
-
-        if (!apiUrl) {
-            logger.error('No meta-core API URL available');
-            return null;
-        }
-
-        return this.fetchUrls(apiUrl);
-    }
-
-    /**
-     * Wait for leader info to be available
+     * Block until meta-core is reachable. Probes immediately then every 500ms,
+     * matching the previous file-polling loop's timing exactly.
      */
     async waitForLeader(timeoutMs: number = 30000): Promise<LeaderLockInfo> {
-        const startTime = Date.now();
-        const pollInterval = 500;
+        await this.ensureStarted();
+        const deadline = Date.now() + timeoutMs;
 
-        while (Date.now() - startTime < timeoutMs) {
+        await this.locator.waitForCore(timeoutMs);
+
+        while (Date.now() < deadline) {
             const info = await this.getLeaderInfo();
             if (info) {
-                logger.info(`Leader found: ${info.hostname} at ${info.redisUrl}`);
+                logger.info(`meta-core found: ${info.hostname} at ${info.apiUrl}`);
                 return info;
             }
-
-            logger.debug('Waiting for leader...');
-            await new Promise(resolve => setTimeout(resolve, pollInterval));
+            logger.debug('Waiting for meta-core...');
+            await new Promise(resolve => setTimeout(resolve, 500));
         }
-
-        throw new Error(`No leader found within ${timeoutMs}ms`);
+        throw new Error(`No meta-core found within ${timeoutMs}ms`);
     }
 
     /**
-     * Start watching for leader changes
+     * Previously an fs.watch on the lock directory. Discovery is always
+     * listening, so this only has to make sure the node is running.
      */
     startWatching(): void {
-        if (this.watcher) {
-            return; // Already watching
-        }
-
-        const lockDir = dirname(this.infoFilePath);
-
-        try {
-            this.watcher = watch(lockDir, (eventType, filename) => {
-                if (filename === 'kv-leader.info') {
-                    logger.debug(`Lock file ${eventType}, invalidating cache...`);
-                    // Invalidate cache to force fresh API call
-                    this.cachedUrls = null;
-                    this.urlsCacheTime = 0;
-
-                    this.getLeaderInfo().then(() => {
-                        this.notifyChange();
-                    }).catch((err) => logger.error(`Error reloading leader info: ${err.message}`));
-                }
-            });
-
-            this.watcher.on('error', (error: any) => {
-                logger.warn(`File watcher error: ${error.message}`);
-            });
-
-            logger.info(`Watching for leader changes in ${lockDir}`);
-        } catch (error: any) {
-            logger.error(`Failed to start watching: ${error.message}`);
-        }
+        void this.ensureStarted();
     }
 
-    /**
-     * Stop watching for leader changes
-     */
     stopWatching(): void {
-        if (this.watcher) {
-            this.watcher.close();
-            this.watcher = null;
-            logger.debug('Stopped watching for leader changes');
-        }
+        // No-op: the locator keeps listening until close().
     }
 
-    /**
-     * Register callback for leader changes
-     */
     onChange(callback: () => void): this {
         this.onChangeCallbacks.push(callback);
         return this;
     }
 
-    /**
-     * Notify all change callbacks
-     */
     private notifyChange(): void {
+        logger.debug('meta-core changed, invalidating cache...');
         for (const callback of this.onChangeCallbacks) {
             try {
                 callback();
@@ -273,18 +250,23 @@ export class LeaderClient {
         }
     }
 
-    /**
-     * Get cached leader info (without re-reading file)
-     */
     getCachedLeaderInfo(): LeaderLockInfo | null {
         return this.leaderInfo;
     }
 
-    /**
-     * Clean up resources
-     */
+    /** Neighbours for the nav menu (one row per service name). */
+    getNeighbors(): MeshNeighbor[] {
+        return this.locator.getNeighbors();
+    }
+
+    /** This service's own announce, so the menu can show itself. */
+    self(): MeshNeighbor {
+        return this.locator.self();
+    }
+
     close(): void {
-        this.stopWatching();
         this.onChangeCallbacks = [];
+        void this.locator.stop();
+        this.started = false;
     }
 }
