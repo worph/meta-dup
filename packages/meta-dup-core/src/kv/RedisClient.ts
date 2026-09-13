@@ -120,7 +120,6 @@ export interface FileMetadata {
 
     // Title information (for folder organization)
     title?: string;
-    titles?: { eng?: string; [key: string]: string | undefined };
     originalTitle?: string;
     fileName?: string;
 
@@ -436,12 +435,6 @@ export class RedisClient implements Partial<IKVClient> {
             mtime = isNaN(parsed) ? parseFloat(data.mtime) : parsed;
         }
 
-        // Parse titles - can be nested object or simple string
-        let titles: { eng?: string; [key: string]: string | undefined } | undefined;
-        if (data['titles/eng']) {
-            titles = { eng: data['titles/eng'] };
-        }
-
         // Parse season/episode (can be 0 for specials)
         const season = data.season !== undefined ? parseInt(data.season, 10) : undefined;
         const episode = data.episode !== undefined ? parseInt(data.episode, 10) : undefined;
@@ -472,7 +465,6 @@ export class RedisClient implements Partial<IKVClient> {
 
             // Title information
             title: data.title,
-            titles,
             originalTitle: data.originalTitle,
             fileName: data.fileName,
 

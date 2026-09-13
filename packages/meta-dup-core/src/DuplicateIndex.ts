@@ -189,9 +189,6 @@ export class DuplicateIndex {
         if (metadata.title) {
             return metadata.title;
         }
-        if (metadata.titles?.eng) {
-            return metadata.titles.eng;
-        }
         if (metadata.originalTitle) {
             return metadata.originalTitle;
         }

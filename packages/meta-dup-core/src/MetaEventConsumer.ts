@@ -19,7 +19,7 @@ const CONSUMER_GROUP = 'meta-dup-meta-consumer';
 
 // Fields that affect title duplicate detection
 const TITLE_FIELDS = [
-    'title', 'titles/eng', 'originalTitle', 'fileName',
+    'title', 'originalTitle', 'fileName',
     'year', 'movieYear', 'season', 'episode', 'tmdb'
 ];
 
