@@ -2,7 +2,7 @@
  * KV Manager for meta-dup (FOLLOWER-only)
  *
  * Simplified KV manager that:
- * 1. Discovers the leader via LeaderClient (reads kv-leader.info)
+ * 1. Locates meta-core via LeaderClient (UDP announce, meta-discovery v1)
  * 2. Creates Redis client connection
  * 3. Handles reconnection on leader failure
  *
@@ -81,7 +81,12 @@ export class KVManager {
         // No separate service registration step any more: the LeaderClient's
         // discovery node announces this service on the same UDP group it
         // listens on, so being discoverable and discovering are one thing.
-        const apiUrl = this.config.baseUrl || `http://${hostname()}:${this.config.apiPort}`;
+        // Browser-facing URL for the nav menu, in the order the spec requires:
+        // PUBLIC_URL (reachable when there is no Caddy perimeter in front — a
+        // debug-direct port) -> BASE_URL (the Caddy URL) -> container host.
+        // Announcing a Caddy URL on a stack with no Caddy running is what puts
+        // dead links in every neighbour's menu.
+        const apiUrl = process.env.PUBLIC_URL || this.config.baseUrl || `http://${hostname()}:${this.config.apiPort}`;
 
         // If direct Redis URL provided, skip leader discovery
         if (this.config.redisUrl) {
@@ -334,10 +339,6 @@ export class KVManager {
     /**
      * Get service registration instance
      */
-    /** @deprecated File-based registration is gone; always null. */
-    getServiceRegistration(): null {
-        return null;
-    }
 
     /**
      * Get configured paths

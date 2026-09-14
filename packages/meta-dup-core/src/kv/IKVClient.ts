@@ -58,7 +58,7 @@ export interface IKVClient {
 }
 
 /**
- * Leader lock file content format (kv-leader.info)
+ * meta-core's identity and URL set (from its UDP announce, or /urls)
  * Written by meta-core leader, read by other services
  */
 export interface LeaderLockInfo {

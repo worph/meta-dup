@@ -1,165 +1,54 @@
-import { useState, useEffect } from 'react';
+import { useEffect } from 'react';
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore -- plain ES module, no .d.ts; imported for its side effect
+// of defining the custom element.
+import '../meta-service-menu.js';
 
-interface ServiceInfo {
-  name: string;
-  hostname: string;
-  baseUrl: string;
-  status: string;
-  lastHeartbeat: string;
-}
+/**
+ * ServiceNav — the neighbouring meta-* services, as a burger menu.
+ *
+ * Since meta-discovery v1 this is a thin wrapper around <meta-service-menu>,
+ * a framework-free custom element shared by every meta-* UI (see
+ * scripts/check-mirrors.sh). The old implementation was ~165 lines of React
+ * that existed in four near-identical copies and polled meta-core's
+ * /api/services; the element polls this service's own /api/neighbors instead,
+ * so the nav still renders when meta-core is down.
+ *
+ * The element lives in shadow DOM and cannot see this app's CSS variables, so
+ * the four --mm-nav-* tokens below map our palette onto it.
+ */
 
-interface ServicesResponse {
-  services: ServiceInfo[];
-  current: string;
-}
-
-const serviceIcons: Record<string, string> = {
-  'meta-sort': '📁',
-  'meta-fuse': '🗂️',
-  'meta-stremio': '🎬',
-  'meta-core': '⚙️',
-  'meta-dup': '🔍',
-  'meta-orbit': '🌐',
-  'default': '📦'
-};
-
-function formatServiceName(name: string): string {
-  return name.split('-').map(word =>
-    word.charAt(0).toUpperCase() + word.slice(1)
-  ).join(' ');
+declare global {
+    // eslint-disable-next-line @typescript-eslint/no-namespace
+    namespace JSX {
+        interface IntrinsicElements {
+            'meta-service-menu': React.DetailedHTMLProps<
+                React.HTMLAttributes<HTMLElement>,
+                HTMLElement
+            > & { current?: string; endpoint?: string; label?: string };
+        }
+    }
 }
 
 function ServiceNav() {
-  const [services, setServices] = useState<ServiceInfo[]>([]);
-  const [loading, setLoading] = useState(true);
-  const currentService = 'meta-dup';
+    useEffect(() => {
+        // Import above is for the side effect of defining the element; this
+        // keeps bundlers from tree-shaking it away in production builds.
+    }, []);
 
-  useEffect(() => {
-    const fetchServices = async () => {
-      try {
-        const response = await fetch('/api/services');
-        if (response.ok) {
-          const data: ServicesResponse = await response.json();
-          setServices(data.services || []);
-        }
-      } catch (error) {
-        console.error('Failed to fetch services:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchServices();
-    const interval = setInterval(fetchServices, 30000);
-    return () => clearInterval(interval);
-  }, []);
-
-  if (loading) return null;
-
-  const sortedServices = [...services].sort((a, b) => a.name.localeCompare(b.name));
-
-  if (sortedServices.length === 0) return null;
-
-  return (
-    <nav className="services-nav">
-      <span className="services-nav-label">Services:</span>
-      <div className="services-nav-items">
-        {sortedServices.map(service => {
-          const icon = serviceIcons[service.name] || serviceIcons.default;
-          const isActive = service.name === currentService;
-          return (
-            <a
-              key={service.name}
-              href={isActive ? '#' : service.baseUrl}
-              className={`service-link${isActive ? ' active' : ''}`}
-              onClick={(e) => {
-                e.preventDefault();
-                if (!isActive) {
-                  window.location.href = service.baseUrl;
+    return (
+        <>
+            <meta-service-menu current="meta-dup" />
+            <style>{`
+                meta-service-menu {
+                    --mm-nav-fg: var(--text-primary, #e0e0e0);
+                    --mm-nav-bg: var(--bg-tertiary, var(--bg-secondary, #1a1a2e));
+                    --mm-nav-border: var(--border-color, rgba(255,255,255,0.14));
+                    --mm-nav-accent: var(--accent-primary, #4ecdc4);
                 }
-              }}
-            >
-              <span className="service-icon">{icon}</span>
-              <span>{formatServiceName(service.name)}</span>
-              <span className="service-status"></span>
-            </a>
-          );
-        })}
-      </div>
-
-      <style>{`
-        .services-nav {
-          background: var(--bg-secondary);
-          border-radius: 12px;
-          padding: 0.5rem;
-          margin-bottom: 1.5rem;
-          display: flex;
-          align-items: center;
-          gap: 0.5rem;
-          flex-wrap: wrap;
-          border: 1px solid var(--border-color);
-        }
-
-        .services-nav-label {
-          color: var(--text-secondary);
-          font-size: 0.85rem;
-          padding: 0.5rem 0.75rem;
-          white-space: nowrap;
-        }
-
-        .services-nav-items {
-          display: flex;
-          gap: 0.5rem;
-          flex-wrap: wrap;
-        }
-
-        .service-link {
-          display: inline-flex;
-          align-items: center;
-          gap: 0.4rem;
-          padding: 0.5rem 1rem;
-          border-radius: 8px;
-          text-decoration: none;
-          font-size: 0.9rem;
-          font-weight: 500;
-          transition: all 0.2s;
-          color: var(--text-primary);
-          background: var(--bg-tertiary);
-          border: 1px solid var(--border-color);
-        }
-
-        .service-link:hover {
-          background: var(--border-color);
-          border-color: rgba(78, 205, 196, 0.5);
-          text-decoration: none;
-        }
-
-        .service-link.active {
-          background: linear-gradient(135deg, rgba(78, 205, 196, 0.2), rgba(68, 160, 141, 0.2));
-          border-color: rgba(78, 205, 196, 0.5);
-        }
-
-        .service-link .service-icon {
-          font-size: 1.1rem;
-        }
-
-        .service-link .service-status {
-          width: 6px;
-          height: 6px;
-          border-radius: 50%;
-          background: var(--accent-primary);
-          margin-left: 0.25rem;
-        }
-
-        @media (max-width: 600px) {
-          .services-nav {
-            flex-direction: column;
-            align-items: flex-start;
-          }
-        }
-      `}</style>
-    </nav>
-  );
+            `}</style>
+        </>
+    );
 }
 
 export default ServiceNav;

@@ -153,7 +153,25 @@ export class APIServer {
             };
         });
 
-        // Note: /api/services is handled by nginx proxy to meta-core (centralized service discovery)
+        // meta-discovery v1: neighbours heard over UDP, from this service's
+        // own map. The previous note here claimed nginx proxied /api/services
+        // to meta-core — it never did (no such location), so meta-dup's nav
+        // has 404'd for its whole life. This one is served locally.
+        this.app.get('/api/neighbors', async (_request, reply) => {
+            const leaderClient = this.kvManager?.getLeaderClient();
+            if (!leaderClient) {
+                return reply.send({ current: 'meta-dup', enabled: false, count: 0, neighbors: [] });
+            }
+            const neighbors = leaderClient.getNeighbors();
+            return reply.send({
+                current: 'meta-dup',
+                enabled: true,
+                count: neighbors.length,
+                neighbors,
+                services: neighbors,
+                self: leaderClient.self(),
+            });
+        });
 
         // Catch-all for SPA routing (serve index.html for non-API routes)
         this.app.setNotFoundHandler(async (request: FastifyRequest, reply: FastifyReply) => {
