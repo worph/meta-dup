@@ -153,16 +153,17 @@ export class APIServer {
             };
         });
 
-        // meta-discovery v1: neighbours heard over UDP, from this service's
+        // beacon v2: neighbours heard over UDP, from this service's
         // own map. The previous note here claimed nginx proxied /api/services
         // to meta-core — it never did (no such location), so meta-dup's nav
         // has 404'd for its whole life. This one is served locally.
-        this.app.get('/api/neighbors', async (_request, reply) => {
+        this.app.get('/api/neighbors', async (request, reply) => {
             const leaderClient = this.kvManager?.getLeaderClient();
             if (!leaderClient) {
                 return reply.send({ current: 'meta-dup', enabled: false, count: 0, neighbors: [] });
             }
-            const neighbors = leaderClient.getNeighbors();
+            const q = (request.query ?? {}) as { all?: string; cap?: string };
+            const neighbors = leaderClient.getNeighbors({ all: !!q.all, cap: q.cap || undefined });
             return reply.send({
                 current: 'meta-dup',
                 enabled: true,

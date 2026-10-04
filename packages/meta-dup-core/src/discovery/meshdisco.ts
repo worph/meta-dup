@@ -1,14 +1,14 @@
 /**
- * meta-discovery v1 — UDP multicast service discovery.
+ * Beacon v2 — local resource advertise / discover over UDP multicast
+ * (239.255.99.1:9099).
  *
- * Replaces the two file-based mechanisms that required a shared /meta-core
- * volume: `locks/kv-leader.info` (locating meta-core at boot) and
- * `services/<name>-<host>.json` (the dashboard nav registry). Both answered the
- * same question — where is meta-core, and who else is on this network — so one
- * announce packet answers both, and discovery scope becomes the docker network
- * rather than the mounted volume.
+ * Every node advertises resources tagged with capability strings
+ * (`metamesh.core`, `metamesh.service/meta-sort`, `metamesh.transport/nzb@1`)
+ * and keeps a live view of everyone else's. This service uses it to locate
+ * meta-core (the `metamesh.core` resource carries its /urls block) and to feed
+ * the nav menu (`metamesh.service/*`), with no shared volume.
  *
- * The normative spec is docs/project-architecture/service-discovery.md.
+ * The normative spec is docs/project-architecture/beacon-v2.md.
  *
  * ⚠ MIRRORED FILE. Byte-identical copies live in meta-sort-core, meta-fuse-core
  * and meta-dup-core. They cannot share a package: meta-fuse-core and
@@ -21,17 +21,23 @@
 import dgram from 'dgram';
 import { hostname, networkInterfaces } from 'os';
 
-export const PROTOCOL_VERSION = 1;
-export const DEFAULT_GROUP = '239.255.77.1';
-export const DEFAULT_PORT = 9399;
+export const PROTO = 'beacon';
+export const VERSION = 2;
+export const DEFAULT_GROUP = '239.255.99.1';
+export const DEFAULT_PORT = 9099;
 export const DEFAULT_INTERVAL_MS = 10_000;
-/** A neighbour unseen for interval × this is dropped. Replaces the reaper. */
+/** A node unheard for interval × this is dropped (evaluated at read time). */
 export const LIVENESS_FACTOR = 3;
+/** Senders stay under this so nothing fragments. */
+export const MAX_DATAGRAM = 1400;
 
-export const TYPE_DISCOVERY = 'discovery';
-export const TYPE_ANNOUNCE = 'announce';
-export const ROLE_CORE = 'core';
-export const ROLE_SERVICE = 'service';
+export const TYPE_PROBE = 'probe';
+export const TYPE_ADVERTISE = 'advertise';
+export const TYPE_BYE = 'bye';
+
+export const CAP_CORE = 'metamesh.core';
+export const CAP_SERVICE_PREFIX = 'metamesh.service/';
+export const CAP_ANY_SERVICE = 'metamesh.service/*';
 
 /** Mirrors meta-core's GET /urls response minus redisUrl (retired). */
 export interface MeshUrls {
@@ -42,38 +48,114 @@ export interface MeshUrls {
     webdavUrlInternal: string;
 }
 
-export interface MeshMessage {
-    v: number;
-    type: string;
-    name?: string;
-    instance?: string;
-    role?: string;
+export interface BeaconNodeInfo {
+    name: string;
+    instance: string;
     version?: string;
+    /** 'starting' | 'running'; absent reads as running. */
     status?: string;
-    baseUrl?: string;
-    /** Present only when role === 'core'. */
-    urls?: MeshUrls;
-    /** Reserved for a future HMAC; v1 ignores it. */
-    token?: string;
 }
 
-export interface MeshNeighbor extends MeshMessage {
+export interface BeaconResource {
+    id: string;
+    caps: string[];
+    /** Well-known: http, ui, manifest, mcp. A '/…' value is relative to http. */
+    endpoints?: Record<string, string>;
+    rev?: string;
+    /** The one consumer instance this resource belongs to. */
+    binds?: string;
+    data?: Record<string, unknown>;
+}
+
+export interface BeaconMessage {
+    proto: string;
+    v: number;
+    type: string;
+    node?: BeaconNodeInfo;
+    resources?: BeaconResource[];
+    from?: string;
+    want?: string[];
+}
+
+/** A node as served by /api/neighbors. */
+export interface MeshNeighbor extends BeaconNodeInfo {
+    resources: BeaconResource[];
+    /** Every resource's caps, flattened. */
+    caps: string[];
+    /** The metamesh.service/* resource's endpoints.ui (v1-compatible field). */
+    baseUrl?: string;
     /** Source address taken from the packet, never from the payload. */
     addr: string;
+    /** Unix seconds. */
     lastSeen: number;
 }
 
 export interface MeshNodeConfig {
     name: string;
     instance?: string;
-    role?: string;
     version?: string;
     group?: string;
     port?: number;
     intervalMs?: number;
     enabled?: boolean;
-    /** Rebuilt on every announce so the payload never goes stale. */
-    payload?: () => { baseUrl?: string; status?: string; urls?: MeshUrls };
+    /** Rebuilt on every advertise so the payload never goes stale. */
+    payload?: () => { status?: string; resources: BeaconResource[] };
+}
+
+/**
+ * Does capability `cap` satisfy `pattern`? `*` matches everything; an `@N` on
+ * the pattern must equal the cap's contract (none ignores it); `x/*` matches
+ * any variant of `x`; otherwise the bases must be equal.
+ */
+export function capMatches(pattern: string, cap: string): boolean {
+    if (pattern === '*') return true;
+    const split = (s: string): [string, string | null] => {
+        const i = s.lastIndexOf('@');
+        return i >= 0 ? [s.slice(0, i), s.slice(i + 1)] : [s, null];
+    };
+    const [pbase, pc] = split(pattern);
+    const [cbase, cc] = split(cap);
+    if (pc !== null && cc !== pc) return false;
+    if (pbase.endsWith('/*')) {
+        const prefix = pbase.slice(0, -2);
+        if (!cbase.startsWith(prefix)) return false;
+        const rest = cbase.slice(prefix.length);
+        return rest.startsWith('/') && rest.length > 1;
+    }
+    return pbase === cbase;
+}
+
+export function resourceMatches(r: BeaconResource, pattern: string): boolean {
+    return (r.caps ?? []).some((c) => capMatches(pattern, c));
+}
+
+/** The named endpoint as an absolute URL ('/…' joins onto endpoints.http). */
+export function resourceEndpoint(r: BeaconResource, name: string): string | undefined {
+    const v = r.endpoints?.[name];
+    if (!v) return undefined;
+    if (!v.startsWith('/')) return v;
+    const base = r.endpoints?.http;
+    return base ? base.replace(/\/+$/, '') + v : undefined;
+}
+
+/**
+ * Decode a datagram; null for anything that is not a well-formed beacon v2
+ * message (beacon v1, meta-discovery v1, other versions, junk).
+ */
+export function parseMessage(buf: Buffer): BeaconMessage | null {
+    let m: BeaconMessage;
+    try {
+        m = JSON.parse(buf.toString('utf8')) as BeaconMessage;
+    } catch {
+        return null;
+    }
+    if (!m || m.proto !== PROTO || m.v !== VERSION) return null;
+    if (m.type === TYPE_PROBE) return m;
+    if (m.type === TYPE_ADVERTISE || m.type === TYPE_BYE) {
+        if (!m.node?.name || !m.node?.instance) return null;
+        return m;
+    }
+    return null;
 }
 
 /** IPv4 addresses of every up, non-internal interface. */
@@ -96,15 +178,44 @@ export function localIPv4(): string {
     return localInterfaceAddresses()[0] ?? hostname();
 }
 
+function envNum(key: string): number | undefined {
+    const n = Number(process.env[key]);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+interface Seen {
+    node: BeaconNodeInfo;
+    resources: BeaconResource[];
+    addr: string;
+    lastSeen: number; // ms
+}
+
+function toNeighbor(s: Seen): MeshNeighbor {
+    const caps: string[] = [];
+    let baseUrl: string | undefined;
+    for (const r of s.resources) {
+        for (const c of r.caps ?? []) if (!caps.includes(c)) caps.push(c);
+        if (!baseUrl && resourceMatches(r, CAP_ANY_SERVICE)) baseUrl = resourceEndpoint(r, 'ui');
+    }
+    return {
+        ...s.node,
+        resources: s.resources,
+        caps,
+        ...(baseUrl ? { baseUrl } : {}),
+        addr: s.addr,
+        lastSeen: s.lastSeen / 1000,
+    };
+}
+
 /**
- * One participant in the mesh: announces itself, answers probes, and keeps a
- * TTL map of everyone else.
+ * One beacon v2 participant: advertises its resources, answers probes, and
+ * keeps a TTL map of every other node.
  */
 export class MeshNode {
     private cfg: Required<Omit<MeshNodeConfig, 'payload'>> & Pick<MeshNodeConfig, 'payload'>;
     private socket: dgram.Socket | null = null;
     private timer: NodeJS.Timeout | null = null;
-    private neighbors = new Map<string, MeshNeighbor>();
+    private nodes = new Map<string, Seen>();
     private ifaceAddrs: string[] = [];
     private listeners: ((n: MeshNeighbor) => void)[] = [];
     private started = false;
@@ -113,11 +224,10 @@ export class MeshNode {
         this.cfg = {
             name: config.name,
             instance: config.instance ?? hostname(),
-            role: config.role ?? ROLE_SERVICE,
             version: config.version ?? '',
-            group: config.group ?? DEFAULT_GROUP,
-            port: config.port ?? DEFAULT_PORT,
-            intervalMs: config.intervalMs ?? DEFAULT_INTERVAL_MS,
+            group: config.group ?? process.env.BEACON_GROUP ?? DEFAULT_GROUP,
+            port: config.port ?? envNum('BEACON_PORT') ?? DEFAULT_PORT,
+            intervalMs: config.intervalMs ?? envNum('BEACON_INTERVAL_MS') ?? DEFAULT_INTERVAL_MS,
             enabled: config.enabled ?? true,
             payload: config.payload,
         };
@@ -125,12 +235,14 @@ export class MeshNode {
 
     async start(): Promise<void> {
         if (this.started || !this.cfg.enabled) {
-            if (!this.cfg.enabled) console.log('[meshdisco] Disabled by configuration');
+            if (!this.cfg.enabled) console.log('[beacon] Disabled by configuration');
             return;
         }
         this.started = true;
 
         await new Promise<void>((resolve) => {
+            // reuseAddr sets SO_REUSEADDR (+ SO_REUSEPORT on Linux for udp4),
+            // so several listeners can share 9099 on one host.
             const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
             this.socket = socket;
 
@@ -138,14 +250,14 @@ export class MeshNode {
             socket.on('error', (err) => {
                 // Never fatal: a host that blocks multicast must degrade, not
                 // take the service down.
-                console.error('[meshdisco] Socket error:', err.message);
+                console.error('[beacon] Socket error:', err.message);
             });
 
             socket.bind(this.cfg.port, '0.0.0.0', () => {
                 try {
                     socket.setMulticastTTL(1); // link-local only
                 } catch (e) {
-                    console.warn('[meshdisco] Could not set multicast TTL:', e);
+                    console.warn('[beacon] Could not set multicast TTL:', e);
                 }
 
                 // Join on EVERY interface. A container on two docker networks
@@ -157,20 +269,20 @@ export class MeshNode {
                         socket.addMembership(this.cfg.group, addr);
                         joined++;
                     } catch (e) {
-                        console.warn(`[meshdisco] Join ${this.cfg.group} on ${addr} failed:`, e);
+                        console.warn(`[beacon] Join ${this.cfg.group} on ${addr} failed:`, e);
                     }
                 }
                 console.log(
-                    `[meshdisco] Listening on ${this.cfg.group}:${this.cfg.port} as ` +
+                    `[beacon] Listening on ${this.cfg.group}:${this.cfg.port} as ` +
                     `${this.cfg.name}/${this.cfg.instance} (joined ${joined} of ${this.ifaceAddrs.length} interfaces)`
                 );
                 resolve();
             });
         });
 
-        this.announce();
+        this.advertise();
         this.probe();
-        this.timer = setInterval(() => this.announce(), this.cfg.intervalMs);
+        this.timer = setInterval(() => this.advertise(), this.cfg.intervalMs);
         // Don't hold the event loop open on shutdown.
         this.timer.unref?.();
     }
@@ -179,9 +291,9 @@ export class MeshNode {
         if (!this.started) return;
         this.started = false;
         if (this.timer) { clearInterval(this.timer); this.timer = null; }
-        // Final "stopping" announce so neighbours drop us immediately rather
-        // than waiting out the staleness window.
-        this.announce('stopping');
+        // Bye, so neighbours drop us immediately rather than waiting out the
+        // staleness window.
+        this.multicast({ proto: PROTO, v: VERSION, type: TYPE_BYE, node: this.nodeInfo() });
         await new Promise<void>((resolve) => {
             if (!this.socket) return resolve();
             try { this.socket.close(() => resolve()); } catch { resolve(); }
@@ -190,135 +302,137 @@ export class MeshNode {
         this.listeners = [];
     }
 
-    /** Multicast a probe; every listener replies immediately. */
-    probe(): void {
-        this.send({ v: PROTOCOL_VERSION, type: TYPE_DISCOVERY });
+    /**
+     * Multicast a probe. Every node owning a resource matching one of `want`
+     * (every node, when empty) replies immediately.
+     */
+    probe(want: string[] = []): void {
+        const msg: BeaconMessage = { proto: PROTO, v: VERSION, type: TYPE_PROBE, from: this.cfg.instance };
+        if (want.length) msg.want = want;
+        this.multicast(msg);
     }
 
-    /** Everyone heard from inside the staleness window, sorted by name. */
+    /** Every live node, sorted by (name, instance). */
     getNeighbors(): MeshNeighbor[] {
         const cutoff = Date.now() - this.cfg.intervalMs * LIVENESS_FACTOR;
         const out: MeshNeighbor[] = [];
-        for (const [key, nb] of this.neighbors) {
-            if (nb.lastSeen < cutoff) { this.neighbors.delete(key); continue; }
-            out.push(nb);
+        for (const [key, s] of this.nodes) {
+            if (s.lastSeen < cutoff) { this.nodes.delete(key); continue; }
+            out.push(toNeighbor(s));
         }
-        return out.sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''));
+        return out.sort((a, b) => a.name.localeCompare(b.name) || a.instance.localeCompare(b.instance));
     }
 
-    /** One row per service name, most recently seen instance wins. */
+    /** One row per node name, most recently seen instance wins. */
     getNeighborsByName(): MeshNeighbor[] {
         const best = new Map<string, MeshNeighbor>();
         for (const nb of this.getNeighbors()) {
-            const cur = best.get(nb.name ?? '');
-            if (!cur || nb.lastSeen > cur.lastSeen) best.set(nb.name ?? '', nb);
+            const cur = best.get(nb.name);
+            if (!cur || nb.lastSeen > cur.lastSeen) best.set(nb.name, nb);
         }
-        return [...best.values()].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''));
+        return [...best.values()].sort((a, b) => a.name.localeCompare(b.name));
     }
 
-    /** Cores only — what a locator filters on. */
-    getCores(): MeshNeighbor[] {
-        return this.getNeighbors().filter((n) => n.role === ROLE_CORE && n.urls);
-    }
-
-    /** This node's own announce, so a UI can render itself without waiting. */
+    /** This node as a row, so a UI can render itself without waiting. */
     self(): MeshNeighbor {
-        return { ...this.buildAnnounce('running'), addr: '', lastSeen: Date.now() };
+        const { status, resources } = this.payload();
+        return toNeighbor({ node: this.nodeInfo(status), resources, addr: '', lastSeen: Date.now() });
     }
 
-    /** Fires for every announce received (after the self-echo filter). */
-    onAnnounce(cb: (n: MeshNeighbor) => void): void {
+    /** Fires for every advertise received (after the self-echo filter). */
+    onAdvertise(cb: (n: MeshNeighbor) => void): void {
         this.listeners.push(cb);
     }
 
-    private onMessage(buf: Buffer, rinfo: dgram.RemoteInfo): void {
-        let msg: MeshMessage;
-        try {
-            msg = JSON.parse(buf.toString('utf8')) as MeshMessage;
-        } catch {
-            return; // foreign traffic on the group
-        }
-        if (msg.v !== PROTOCOL_VERSION) return;
-        // Drop our own multicast echo.
-        if (msg.instance && msg.instance === this.cfg.instance && msg.name === this.cfg.name) return;
+    private payload(): { status?: string; resources: BeaconResource[] } {
+        return this.cfg.payload ? this.cfg.payload() : { resources: [] };
+    }
 
-        if (msg.type === TYPE_DISCOVERY) {
-            this.replyTo(rinfo);
+    private nodeInfo(status?: string): BeaconNodeInfo {
+        const n: BeaconNodeInfo = { name: this.cfg.name, instance: this.cfg.instance };
+        if (this.cfg.version) n.version = this.cfg.version;
+        if (status) n.status = status;
+        return n;
+    }
+
+    private advertiseMsg(): BeaconMessage {
+        const { status, resources } = this.payload();
+        return { proto: PROTO, v: VERSION, type: TYPE_ADVERTISE, node: this.nodeInfo(status), resources };
+    }
+
+    private onMessage(buf: Buffer, rinfo: dgram.RemoteInfo): void {
+        const msg = parseMessage(buf);
+        if (!msg) return; // v1 or foreign traffic on the shared group
+
+        if (msg.type === TYPE_PROBE) {
+            if (msg.from === this.cfg.instance) return;
+            const ad = this.advertiseMsg();
+            const want = msg.want ?? [];
+            const wanted = want.length === 0 ||
+                (ad.resources ?? []).some((r) => want.some((p) => resourceMatches(r, p)));
+            if (wanted) this.replyTo(ad, rinfo);
             return;
         }
-        if (msg.type !== TYPE_ANNOUNCE || !msg.name) return;
 
-        const key = msg.instance ? `${msg.name}|${msg.instance}` : msg.name;
-        if (msg.status === 'stopping') { this.neighbors.delete(key); return; }
+        const node = msg.node!;
+        if (node.instance === this.cfg.instance) return; // our own echo
+        if (msg.type === TYPE_BYE) { this.nodes.delete(node.instance); return; }
 
-        const nb: MeshNeighbor = { ...msg, addr: rinfo.address, lastSeen: Date.now() };
-        this.neighbors.set(key, nb);
+        const seen: Seen = { node, resources: msg.resources ?? [], addr: rinfo.address, lastSeen: Date.now() };
+        this.nodes.set(node.instance, seen);
+        const nb = toNeighbor(seen);
         for (const cb of this.listeners) {
-            try { cb(nb); } catch (e) { console.error('[meshdisco] Listener threw:', e); }
+            try { cb(nb); } catch (e) { console.error('[beacon] Listener threw:', e); }
         }
     }
 
-    private buildAnnounce(status: string): MeshMessage {
-        const msg: MeshMessage = {
-            v: PROTOCOL_VERSION,
-            type: TYPE_ANNOUNCE,
-            name: this.cfg.name,
-            instance: this.cfg.instance,
-            role: this.cfg.role,
-            version: this.cfg.version,
-            status,
-        };
-        if (this.cfg.payload) {
-            const p = this.cfg.payload();
-            if (p.baseUrl) msg.baseUrl = p.baseUrl;
-            if (p.status && status === 'running') msg.status = p.status;
-            // Only a core may carry a URLs block — a service announcing one
-            // would let any container impersonate meta-core.
-            if (this.cfg.role === ROLE_CORE && p.urls) msg.urls = p.urls;
+    private encode(msg: BeaconMessage): Buffer {
+        const body = Buffer.from(JSON.stringify(msg));
+        if (body.length > MAX_DATAGRAM) {
+            console.warn(`[beacon] ${body.length}-byte datagram exceeds the fragmentation-safe ${MAX_DATAGRAM}`);
         }
-        return msg;
+        return body;
     }
 
-    private announce(status = 'running'): void {
-        this.send(this.buildAnnounce(status));
+    private advertise(): void {
+        this.multicast(this.advertiseMsg());
     }
 
-    private replyTo(rinfo: dgram.RemoteInfo): void {
-        const body = Buffer.from(JSON.stringify(this.buildAnnounce('running')));
+    private replyTo(msg: BeaconMessage, rinfo: dgram.RemoteInfo): void {
         try {
-            this.socket?.send(body, rinfo.port, rinfo.address);
+            this.socket?.send(this.encode(msg), rinfo.port, rinfo.address);
         } catch (e) {
-            console.warn('[meshdisco] Reply failed:', e);
+            console.warn('[beacon] Reply failed:', e);
         }
     }
 
     /** Writes once per interface — the default route alone reaches one network. */
-    private send(msg: MeshMessage): void {
+    private multicast(msg: BeaconMessage): void {
         const socket = this.socket;
         if (!socket) return;
-        const body = Buffer.from(JSON.stringify(msg));
+        const body = this.encode(msg);
         for (const addr of this.ifaceAddrs) {
             try {
                 socket.setMulticastInterface(addr);
                 socket.send(body, this.cfg.port, this.cfg.group);
             } catch (e) {
-                console.warn(`[meshdisco] Send on ${addr} failed:`, e);
+                console.warn(`[beacon] Send on ${addr} failed:`, e);
             }
         }
     }
 }
 
 export interface MetaCoreLocatorConfig {
-    /** This service's name, for its own announce. */
+    /** This service's name, for its own advertise. */
     serviceName: string;
     /** Browser-facing URL for the nav menu. */
     baseUrl?: string;
     version?: string;
     /**
      * Explicit meta-core API URL. When set this ALWAYS wins and the wire is
-     * never consulted for core selection — see the spec's "the pin always
-     * wins". This is what stops a client box from latching onto a gateway
-     * box's core when both are reachable on a shared network.
+     * never consulted for core selection — see the spec's "the
+     * metamesh.core pin". This is what stops a client box from latching onto a
+     * gateway box's core when both are reachable on a shared network.
      */
     metaCoreUrl?: string;
     group?: string;
@@ -328,8 +442,9 @@ export interface MetaCoreLocatorConfig {
 }
 
 /**
- * Locates meta-core over UDP, replacing the read of
- * /meta-core/locks/kv-leader.info.
+ * Locates meta-core over beacon v2 (the first `metamesh.core` resource that
+ * carries `data.urls`), and advertises this service as
+ * `metamesh.service/<serviceName>`.
  */
 export class MetaCoreLocator {
     private node: MeshNode;
@@ -341,35 +456,42 @@ export class MetaCoreLocator {
         this.cfg = config;
         this.node = new MeshNode({
             name: config.serviceName,
-            role: ROLE_SERVICE,
             version: config.version,
             group: config.group,
             port: config.port,
             intervalMs: config.intervalMs,
             enabled: config.enabled,
-            payload: () => ({ baseUrl: config.baseUrl ?? `http://${localIPv4()}` }),
+            payload: () => ({
+                resources: [{
+                    id: 'service',
+                    caps: [CAP_SERVICE_PREFIX + config.serviceName],
+                    endpoints: { ui: config.baseUrl ?? `http://${localIPv4()}` },
+                }],
+            }),
         });
 
-        this.node.onAnnounce((nb) => {
-            if (nb.role !== ROLE_CORE || !nb.urls) return;
+        this.node.onAdvertise((nb) => {
             if (this.cfg.metaCoreUrl) return; // pinned: the wire cannot move us
+            const core = nb.resources.find((r) => resourceMatches(r, CAP_CORE));
+            const urls = core?.data?.urls as MeshUrls | undefined;
+            if (!urls?.apiUrl) return;
 
             const prev = this.current;
             if (!prev) {
-                this.current = nb.urls;
-                console.log(`[meshdisco] meta-core discovered at ${nb.urls.apiUrl} (${nb.addr})`);
+                this.current = urls;
+                console.log(`[beacon] meta-core discovered at ${urls.apiUrl} (${nb.addr})`);
                 this.notifyChange();
                 return;
             }
-            if (prev.apiUrl === nb.urls.apiUrl) {
-                this.current = nb.urls; // refresh the rest of the fields
+            if (prev.apiUrl === urls.apiUrl) {
+                this.current = urls; // refresh the rest of the fields
                 return;
             }
-            // A second, different core is announcing. Do not flap between
+            // A second, different core is advertising. Do not flap between
             // them — keep the first and say so loudly, because on a PCS box
             // this means a client container can see the gateway's core.
             console.warn(
-                `[meshdisco] Ignoring a second meta-core at ${nb.urls.apiUrl} (${nb.addr}); ` +
+                `[beacon] Ignoring a second meta-core at ${urls.apiUrl} (${nb.addr}); ` +
                 `staying with ${prev.apiUrl}. Set META_CORE_URL to pin this explicitly.`
             );
         });
@@ -377,7 +499,7 @@ export class MetaCoreLocator {
 
     async start(): Promise<void> {
         if (this.cfg.metaCoreUrl) {
-            console.log(`[meshdisco] meta-core pinned to ${this.cfg.metaCoreUrl}; discovery is advisory`);
+            console.log(`[beacon] meta-core pinned to ${this.cfg.metaCoreUrl}; discovery is advisory`);
         }
         await this.node.start();
     }
@@ -409,11 +531,11 @@ export class MetaCoreLocator {
         while (Date.now() < deadline) {
             const url = this.getApiUrl();
             if (url) return url;
-            if (!logged) { console.log('[meshdisco] Waiting for meta-core...'); logged = true; }
-            this.node.probe();
+            if (!logged) { console.log('[beacon] Waiting for meta-core...'); logged = true; }
+            this.node.probe([CAP_CORE]);
             await new Promise((r) => setTimeout(r, 500));
         }
-        throw new Error(`[meshdisco] No meta-core found within ${timeoutMs}ms`);
+        throw new Error(`[beacon] No meta-core found within ${timeoutMs}ms`);
     }
 
     /** Fires when the elected core's apiUrl changes. Replaces the fs.watch. */
@@ -421,21 +543,27 @@ export class MetaCoreLocator {
         this.changeCallbacks.push(cb);
     }
 
-    getNeighbors(): MeshNeighbor[] {
-        return this.node.getNeighborsByName();
+    /**
+     * Neighbours for /api/neighbors: one row per name (or every instance with
+     * `all`), optionally only nodes with a resource matching `cap`.
+     */
+    getNeighbors(opts: { all?: boolean; cap?: string } = {}): MeshNeighbor[] {
+        const list = opts.all ? this.node.getNeighbors() : this.node.getNeighborsByName();
+        const cap = opts.cap;
+        return cap ? list.filter((n) => n.resources.some((r) => resourceMatches(r, cap))) : list;
     }
 
     self(): MeshNeighbor {
         return this.node.self();
     }
 
-    probe(): void {
-        this.node.probe();
+    probe(want: string[] = []): void {
+        this.node.probe(want);
     }
 
     private notifyChange(): void {
         for (const cb of this.changeCallbacks) {
-            try { cb(); } catch (e) { console.error('[meshdisco] Change callback threw:', e); }
+            try { cb(); } catch (e) { console.error('[beacon] Change callback threw:', e); }
         }
     }
 }

@@ -9,7 +9,7 @@ Standalone duplicate detection service for MetaMesh v2. Detects duplicate files 
 ## Architecture
 
 meta-dup is a read-only service that:
-1. Locates meta-core over UDP multicast (meta-discovery v1, `239.255.77.1:9399`) — or uses `META_CORE_URL` when pinned
+1. Locates meta-core over UDP multicast (beacon v2, `239.255.99.1:9099`) — or uses `META_CORE_URL` when pinned
 2. Builds an in-memory duplicate index from every record in Redis on startup
 3. Consumes Redis Streams for real-time updates (`file:events` for file add/change/delete/rename, `meta:events` for title-field changes)
 4. Provides a REST API and web dashboard (nginx on port 80 → Fastify on 3000)
@@ -20,7 +20,7 @@ meta-core ──► Redis Streams ──► meta-dup ──► Dashboard / REST 
                meta:events)
 ```
 
-See [service-discovery.md](../../docs/project-architecture/service-discovery.md) for the discovery protocol.
+See [beacon-v2.md](../../docs/project-architecture/beacon-v2.md) for the discovery protocol.
 
 ## API Endpoints
 
@@ -32,7 +32,7 @@ See [service-discovery.md](../../docs/project-architecture/service-discovery.md)
 | `/api/duplicates/title` | GET | Title duplicates only |
 | `/api/duplicates/stats` | GET | Duplicate statistics |
 | `/api/duplicates/rebuild` | POST | Force rebuild from Redis |
-| `/api/neighbors` | GET | Services heard over meta-discovery v1 (dashboard nav menu) |
+| `/api/neighbors` | GET | Services heard over beacon v2 (dashboard nav menu) |
 
 ## Response Format
 
@@ -82,7 +82,7 @@ The main dev stack no longer defines a meta-dup container, so `dev/scripts/reloa
 
 ## Configuration
 
-meta-core is located over UDP (meta-discovery v1); no `/meta-core` volume mount or `REDIS_URL` is needed.
+meta-core is located over UDP (beacon v2); no `/meta-core` volume mount or `REDIS_URL` is needed.
 
 ### Environment Variables
 
@@ -115,7 +115,7 @@ packages/meta-dup/
     │   │   ├── api/
     │   │   │   └── APIServer.ts      # Fastify REST API
     │   │   ├── discovery/
-    │   │   │   └── meshdisco.ts      # meta-discovery v1 (mirrored, see scripts/check-mirrors.sh)
+    │   │   │   └── meshdisco.ts      # beacon v2 (mirrored, see scripts/check-mirrors.sh)
     │   │   └── kv/                   # Redis client + meta-core locator (LeaderClient)
     │   └── package.json
     └── meta-dup-ui/        # React dashboard

@@ -2,7 +2,7 @@
  * KV Manager for meta-dup (FOLLOWER-only)
  *
  * Simplified KV manager that:
- * 1. Locates meta-core via LeaderClient (UDP announce, meta-discovery v1)
+ * 1. Locates meta-core via LeaderClient (UDP announce, beacon v2)
  * 2. Creates Redis client connection
  * 3. Handles reconnection on leader failure
  *

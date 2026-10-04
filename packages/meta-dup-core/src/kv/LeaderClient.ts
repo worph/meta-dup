@@ -1,7 +1,8 @@
 /**
  * LeaderClient - locates meta-core and exposes its URLs.
  *
- * Since meta-discovery v1 this is a thin adapter over MetaCoreLocator
+ * Since UDP discovery (meta-discovery v1, now beacon v2) this is a thin adapter
+ * over MetaCoreLocator
  * (../discovery/meshdisco.js): meta-core is found by UDP announce instead of by
  * reading /meta-core/locks/kv-leader.info, which means this service no longer
  * needs the /meta-core volume mounted at all.
@@ -254,12 +255,15 @@ export class LeaderClient {
         return this.leaderInfo;
     }
 
-    /** Neighbours for the nav menu (one row per service name). */
-    getNeighbors(): MeshNeighbor[] {
-        return this.locator.getNeighbors();
+    /**
+     * Neighbours for /api/neighbors: one row per name (every instance with
+     * `all`), optionally only nodes with a capability matching `cap`.
+     */
+    getNeighbors(opts: { all?: boolean; cap?: string } = {}): MeshNeighbor[] {
+        return this.locator.getNeighbors(opts);
     }
 
-    /** This service's own announce, so the menu can show itself. */
+    /** This service's own row, so the menu can show itself. */
     self(): MeshNeighbor {
         return this.locator.self();
     }
