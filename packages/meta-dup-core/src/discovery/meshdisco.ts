@@ -102,6 +102,85 @@ export interface MeshNodeConfig {
     payload?: () => { status?: string; resources: BeaconResource[] };
 }
 
+/** How a discovered resource relates to this consumer (Scan card). */
+export type ScanState = 'configured' | 'addable' | 'bound-elsewhere';
+
+export interface ScanCandidate {
+    instance: string;
+    name: string;
+    version?: string;
+    resourceId: string;
+    caps: string[];
+    /** endpoints.http — what the consumer would register. */
+    url: string;
+    binds?: string;
+    state: ScanState;
+    /** The list entry that already holds this URL (state `configured`). */
+    configuredAs?: string;
+    /** A list-safe name to register it under. */
+    suggestedName: string;
+}
+
+/** Same JSON as meta-feeder-sdk `beacon::ScanReport`. */
+export interface ScanReport {
+    cap: string;
+    self: string;
+    durationMs: number;
+    summary: { nodes: number; capable: number; configured: number; boundElsewhere: number; addable: number };
+    candidates: ScanCandidate[];
+}
+
+/** Lower-case, `[a-z0-9._-]` only — accepted by every consumer's name rules. */
+export function suggestedName(instance: string): string {
+    const s = instance.trim().toLowerCase().replace(/[^a-z0-9._-]/g, '-');
+    return s || 'plugin';
+}
+
+const normUrl = (u: string) => u.trim().replace(/\/+$/, '');
+
+/**
+ * Classify every resource matching `pattern` against the consumer's
+ * `(name, url)` list. Mirrors meta-feeder-sdk `beacon::classify`.
+ */
+export function classifyScan(
+    pattern: string,
+    self: string,
+    neighbors: MeshNeighbor[],
+    configured: Array<[string, string]>,
+): ScanReport {
+    const summary = { nodes: neighbors.length, capable: 0, configured: 0, boundElsewhere: 0, addable: 0 };
+    const candidates: ScanCandidate[] = [];
+    for (const n of neighbors) {
+        for (const r of n.resources) {
+            if (!resourceMatches(r, pattern)) continue;
+            const http = resourceEndpoint(r, 'http');
+            if (!http) continue; // nothing a consumer could register
+            const url = normUrl(http);
+            summary.capable++;
+            const hit = configured.find(([, u]) => normUrl(u) === url);
+            let state: ScanState;
+            if (hit) { state = 'configured'; summary.configured++; }
+            else if (r.binds && r.binds !== self) { state = 'bound-elsewhere'; summary.boundElsewhere++; }
+            else { state = 'addable'; summary.addable++; }
+            candidates.push({
+                instance: n.instance,
+                name: n.name,
+                ...(n.version ? { version: n.version } : {}),
+                resourceId: r.id,
+                caps: r.caps ?? [],
+                url,
+                ...(r.binds ? { binds: r.binds } : {}),
+                state,
+                ...(hit ? { configuredAs: hit[0] } : {}),
+                suggestedName: suggestedName(n.instance),
+            });
+        }
+    }
+    const rank: Record<ScanState, number> = { addable: 0, configured: 1, 'bound-elsewhere': 2 };
+    candidates.sort((a, b) => rank[a.state] - rank[b.state] || a.instance.localeCompare(b.instance));
+    return { cap: pattern, self, durationMs: 0, summary, candidates };
+}
+
 /**
  * Does capability `cap` satisfy `pattern`? `*` matches everything; an `@N` on
  * the pattern must equal the cap's contract (none ignores it); `x/*` matches
@@ -333,6 +412,19 @@ export class MeshNode {
         return [...best.values()].sort((a, b) => a.name.localeCompare(b.name));
     }
 
+    /**
+     * The Scan card: probe everyone, wait `waitMs` for the replies, then
+     * classify what matches `pattern` against `configured` ([name, url]).
+     */
+    async scan(pattern: string, configured: Array<[string, string]>, waitMs = 1500): Promise<ScanReport> {
+        const started = Date.now();
+        this.probe();
+        await new Promise((r) => setTimeout(r, waitMs));
+        const report = classifyScan(pattern, this.cfg.instance, this.getNeighbors(), configured);
+        report.durationMs = Date.now() - started;
+        return report;
+    }
+
     /** This node as a row, so a UI can render itself without waiting. */
     self(): MeshNeighbor {
         const { status, resources } = this.payload();
@@ -555,6 +647,11 @@ export class MetaCoreLocator {
 
     self(): MeshNeighbor {
         return this.node.self();
+    }
+
+    /** The Scan card — see {@link MeshNode.scan}. */
+    scan(pattern: string, configured: Array<[string, string]>, waitMs = 1500): Promise<ScanReport> {
+        return this.node.scan(pattern, configured, waitMs);
     }
 
     probe(want: string[] = []): void {
